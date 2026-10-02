@@ -14,7 +14,7 @@ if (!globalForPrisma.pool) {
 
 // Standalone backend installs can resolve a second @types/pg copy under the
 // adapter. Both declarations describe the same runtime Pool instance.
-const adapter = new PrismaPg(globalForPrisma.pool as ConstructorParameters<typeof PrismaPg>[0]);
+const adapter = new PrismaPg(globalForPrisma.pool as unknown as ConstructorParameters<typeof PrismaPg>[0]);
 
 export const prisma =
   globalForPrisma.prisma ||
