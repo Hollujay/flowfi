@@ -210,7 +210,6 @@ model KycAttestation {
 }
 
 
-
 // IndexerDeadLetterEvent model - quarantines Soroban events whose processing
 // failed (unexpected payload shape, transient DB lock, RPC timeout mid-handler).
 // A quarantined event is never retried inline by the poll loop, so one malformed

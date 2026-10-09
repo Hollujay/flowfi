@@ -59,9 +59,9 @@ RUN node /app/node_modules/@prisma/engines/scripts/postinstall.js
 # Copy the prisma schema into the runner. The boot-and-check-health step
 # in .github/workflows/ci.yml runs `npx prisma db push` against this
 # container; without prisma/schema.prisma on disk, that command errors
-# out and the 60-iteration /health poll times the job out. That step passes
-# `--skip-generate` because the client is already baked into dist/generated
-# above — regenerating would need write access to the root-owned
+# out and the 60-iteration /health poll times the job out. Prisma 7's
+# `db push` does not regenerate the client (it is already baked into
+# dist/generated above), so it never needs write access to the root-owned
 # node_modules tree, which the non-root `node` user deliberately does not have.
 COPY prisma ./prisma
 

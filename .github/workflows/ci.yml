@@ -220,11 +220,11 @@ jobs:
           sleep 10
           # The production image runs as the non-root `node` user and already
           # ships the generated Prisma client (built in the builder stage and
-          # copied to dist/generated). `db push` otherwise triggers `prisma
-          # generate`, which needs to write into the root-owned node_modules
-          # tree and fails with "Can't write to /app/node_modules/prisma".
-          # Skip it: the client is already present, so only the schema push runs.
-          docker compose run --rm -e DATABASE_URL=postgresql://flowfi:flowfi_dev_password@postgres:5432/flowfi backend npx -y prisma db push --accept-data-loss --skip-generate
+          # copied to dist/generated). Since Prisma 7, `db push` no longer runs
+          # `prisma generate` (and rejects the old `--skip-generate` flag), so
+          # only the schema push runs and nothing writes into the root-owned
+          # node_modules tree.
+          docker compose run --rm -e DATABASE_URL=postgresql://flowfi:flowfi_dev_password@postgres:5432/flowfi backend npx -y prisma db push --accept-data-loss
           docker compose up -d backend
           # Poll /health instead of a fixed sleep so cold-boot / Prisma-warmup
           # latency does not flake the Backend Docker Image CI.
