@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { StellarExplorerLink } from "../StellarExplorerLink";
-import { vi, describe, it, expect, beforeEach } from "vitest";
 
 // Mutable network state shared with the hoisted module mock, so the mainnet
 // case can be exercised without re-mocking the module.

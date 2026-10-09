@@ -42,7 +42,7 @@ describe("CancelConfirmModal submission and validation", () => {
     await waitFor(() => {
       expect(baseProps.onConfirm).toHaveBeenCalledWith("stream-42");
     });
-    expect(transactionSuccessToast).toHaveBeenCalledWith("Stream stream-42 cancelled successfully", undefined);
+    expect(transactionSuccessToast).toHaveBeenCalledWith("Stream stream-42 cancelled successfully");
   });
 
   it("shows toast.error and re-enables the confirm button when onConfirm rejects", async () => {

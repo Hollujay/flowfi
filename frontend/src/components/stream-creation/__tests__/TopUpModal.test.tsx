@@ -83,7 +83,7 @@ describe("TopUpModal", () => {
       await waitFor(() => {
         expect(baseProps.onConfirm).toHaveBeenCalledWith("stream-42", "100.5");
       });
-      expect(transactionSuccessToast).toHaveBeenCalledWith("Successfully added 100.5 USDC to stream", undefined);
+      expect(transactionSuccessToast).toHaveBeenCalledWith("Successfully added 100.5 USDC to stream");
     });
   });
 

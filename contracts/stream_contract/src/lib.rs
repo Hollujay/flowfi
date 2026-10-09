@@ -43,7 +43,7 @@ mod property_tests;
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, token, vec, Address, BytesN, Env, IntoVal, InvokeError, Symbol, Vec,
+    contract, contractimpl, token, vec, Address, BytesN, Env, InvokeError, Symbol, Vec,
 };
 
 use errors::StreamError;
@@ -1909,7 +1909,7 @@ impl StreamContract {
         Self::validate_stream_ownership(&stream, &sender)?;
 
         if !stream.is_active {
-            return Err(StreamError::StreamInactive);
+            return Err(StreamError::StreamNotActive);
         }
 
         if !stream.paused {

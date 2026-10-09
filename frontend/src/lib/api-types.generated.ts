@@ -3130,7 +3130,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-
     "/v1/admin/sentinel/alerts": {
         parameters: {
             query?: never;
@@ -3266,7 +3265,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-
 }
 export type webhooks = Record<string, never>;
 export interface components {

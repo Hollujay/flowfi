@@ -358,5 +358,4 @@ pub(crate) mod test_diagnostics {
             );
         }
     }
-
 }

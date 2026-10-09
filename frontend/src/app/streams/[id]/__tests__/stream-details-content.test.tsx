@@ -19,17 +19,23 @@ import React from "react";
 
 // ─── Mocks ──────────────────────────────────────────────────────────────
 
-const mockSession = {
-  publicKey: "GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD",
-  network: "TESTNET",
-  walletName: "Freighter",
-};
+const { origUseWallet, mockSession } = vi.hoisted(() => {
+  const mockSession = {
+    publicKey: "GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD",
+    network: "TESTNET",
+    walletName: "Freighter",
+  };
+  return {
+    origUseWallet: vi.fn(() => ({
+      session: mockSession,
+      isHydrated: true,
+    })),
+    mockSession,
+  };
+});
 
 vi.mock("@/context/wallet-context", () => ({
-  useWallet: () => ({
-    session: mockSession,
-    isHydrated: true,
-  }),
+  useWallet: origUseWallet,
 }));
 
 vi.mock("next/navigation", () => ({
@@ -220,15 +226,7 @@ describe("StreamDetailsContent loading skeleton", () => {
         ok: true,
         json: async () => mockStream,
       } as Response;
-    })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ events: [], total: 0 }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ events: [], total: 0 }),
-      } as Response);
+    });
 
     renderWithQueryClient(<StreamDetailsContent streamId={STREAM_ID} />);
 
@@ -336,16 +334,8 @@ async function renderLoaded(streamOverrides: Record<string, unknown> = {}) {
     return {
       ok: true,
       json: async () => mockStream,
-      } as Response;
-    })
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ events: [], total: 0 }),
-    } as Response)
-    .mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ events: [], total: 0 }),
-    } as Response);
+    } as Response;
+  });
 
   const user = userEvent.setup();
   renderWithQueryClient(<StreamDetailsContent streamId={STREAM_ID} />);
@@ -361,12 +351,6 @@ async function renderLoaded(streamOverrides: Record<string, unknown> = {}) {
 
 // Note: handleWithdraw is only visible when the user is the recipient.
 // The mock session matches the sender, so we re-mock useWallet for these tests.
-const { useWallet: origUseWallet } = vi.hoisted(() => {
-  return { useWallet: vi.fn() };
-});
-vi.mock("@/context/wallet-context", () => ({
-  useWallet: origUseWallet,
-}));
 
 const mockWalletForRecipient = (session = {
   publicKey: "GAV4A377RAEV6YVAWZVHXF4VZD5ZBXGIKEMNHV5YIMV5LIKSNQVYUBR7",
@@ -396,7 +380,7 @@ describe("StreamDetailsContent handleWithdraw", () => {
     await waitFor(() => {
       expect(mockSoroban.withdrawFromStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Withdrawal successful!", undefined);
+    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Withdrawal successful!");
   });
 
   it("shows error toast when withdrawFromStream throws", async () => {
@@ -460,7 +444,7 @@ describe("StreamDetailsContent handleTopUp", () => {
     await waitFor(() => {
       expect(mockSoroban.topUpStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream topped up successfully!", undefined);
+    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream topped up successfully!");
   });
 
   it("shows error toast when topUpStream throws", async () => {
@@ -526,7 +510,7 @@ describe("StreamDetailsContent handlePause", () => {
         { streamId: BigInt(STREAM_ID) },
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream paused", undefined);
+    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream paused");
   });
 
   it("shows error toast when pauseStream throws", async () => {
@@ -570,7 +554,7 @@ describe("StreamDetailsContent handleResume", () => {
         { streamId: BigInt(STREAM_ID) },
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream resumed", undefined);
+    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream resumed");
   });
 
   it("shows error toast when resumeStream throws", async () => {
@@ -709,11 +693,21 @@ describe("StreamDetailsContent claimable re-sync + pulse", () => {
 
   async function renderStream(overrides: Record<string, unknown> = {}) {
     const mockStream = { ...createMockStream(), ...overrides };
-    vi.mocked(global.fetch)
-      .mockResolvedValueOnce({ ok: true, json: async () => mockStream } as Response)
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ events: [], total: 0 }) } as Response);
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const url = input.toString();
+      if (url.includes("/events")) {
+        return {
+          ok: true,
+          json: async () => ({ events: [], total: 0 }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => mockStream,
+      } as Response;
+    });
 
-    render(<StreamDetailsContent streamId={STREAM_ID} />);
+    renderWithQueryClient(<StreamDetailsContent streamId={STREAM_ID} />);
 
     await waitFor(() => {
       expect(screen.getByText(/stream details/i)).toBeInTheDocument();

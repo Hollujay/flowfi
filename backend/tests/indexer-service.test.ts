@@ -131,7 +131,7 @@ describe('Indexer Service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default pass-through so resetIndexer runs its upsert inside the mutex.
-    hoisted.runExclusive.mockImplementation(async (fn: () => Promise<void>) => {
+    hoisted.runExclusive.mockImplementation(async (fn: () => Promise<unknown>) => {
       await fn();
     });
   });
