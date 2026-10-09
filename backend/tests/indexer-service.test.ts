@@ -11,6 +11,7 @@ const hoisted = vi.hoisted(() => ({
   triggerPoll: vi.fn(),
   processEvent: vi.fn(),
   runExclusive: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  sendDeadLetterAlert: vi.fn(),
 }));
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -45,6 +46,12 @@ vi.mock('../src/logger.js', () => ({
     warn: vi.fn(),
   },
   requestContext: { getStore: vi.fn(() => undefined), run: (_ctx: unknown, fn: () => unknown) => fn() },
+}));
+
+// The dead-letter alert is a chat webhook side effect; mock it so we can assert
+// it fires without any outbound HTTP in tests.
+vi.mock('../src/services/alert.service.js', () => ({
+  sendDeadLetterAlert: hoisted.sendDeadLetterAlert,
 }));
 
 // Metrics and tracing are side-effect-only here; stub them so the assertions
@@ -123,6 +130,10 @@ function nativeToU64(value: number): xdr.ScVal {
 describe('Indexer Service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default pass-through so resetIndexer runs its upsert inside the mutex.
+    hoisted.runExclusive.mockImplementation(async (fn: () => Promise<void>) => {
+      await fn();
+    });
   });
 
   it('returns lagSeconds = -1 when no state row exists', async () => {
@@ -255,9 +266,6 @@ describe('Indexer Service', () => {
 
     // Start the poll, then immediately reset
     const pollPromise = mockedWorker.runExclusive(async () => {
-      mockedPrisma.indexerState.upsert.mockResolvedValueOnce({
-        id: 'singleton', lastLedger: 200, lastCursor: 'cursor-poll', updatedAt: new Date(),
-      });
       await mockedPrisma.indexerState.upsert({
         where: { id: 'singleton' },
         create: { id: 'singleton', lastLedger: 200, lastCursor: 'cursor-poll' },
@@ -318,6 +326,36 @@ describe('Dead-letter payload serialisation', () => {
 describe('quarantineEvent', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('fires an urgent alert webhook when the event is dead-lettered', async () => {
+    mockedPrisma.indexerDeadLetterEvent.upsert.mockResolvedValueOnce({ attempts: 5 });
+
+    await indexerService.quarantineEvent(
+      makeEvent(),
+      new Error('StreamCreated #7: missing body fields'),
+      'cursor-abc',
+    );
+
+    expect(hoisted.sendDeadLetterAlert).toHaveBeenCalledTimes(1);
+    expect(hoisted.sendDeadLetterAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: 'event-0001',
+        eventType: 'stream_created',
+        ledgerSequence: 482910,
+        txHash: 'abc123',
+        errorMessage: 'StreamCreated #7: missing body fields',
+        attempts: 5,
+      }),
+    );
+  });
+
+  it('does not alert when the dead-letter write itself fails', async () => {
+    mockedPrisma.indexerDeadLetterEvent.upsert.mockRejectedValueOnce(new Error('deadlock'));
+
+    await indexerService.quarantineEvent(makeEvent(), new Error('boom'));
+
+    expect(hoisted.sendDeadLetterAlert).not.toHaveBeenCalled();
   });
 
   it('records the event, its error and the decoded event type', async () => {
@@ -476,7 +514,7 @@ describe('replayDeadLetterEvent', () => {
     const replayed = mockedWorker.processEvent.mock.calls[0]![0];
     expect(replayed.id).toBe('event-0001');
     expect(replayed.ledger).toBe(482910);
-    expect(replayed.topic[0].sym.toString()).toBe('stream_created');
+    expect(replayed.topic[0]!.type === 'scvSymbol' && replayed.topic[0].sym.toString()).toBe('stream_created');
   });
 
   it('increments attempts and refreshes the error when the replay throws', async () => {

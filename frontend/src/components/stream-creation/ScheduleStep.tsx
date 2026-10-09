@@ -1,12 +1,17 @@
 "use client";
 
+import { useMemo } from "react";
 import { AlertTriangle } from "lucide-react";
+import type { StreamFormData, StreamFormErrors } from "@/lib/stream-validation";
 
-import { type StreamFormData } from "@/hooks/useStreamForm";
+type ScheduleFormData = Pick<
+  StreamFormData,
+  "duration" | "durationUnit" | "descriptionTag" | "memo"
+>;
 
 interface ScheduleStepProps {
-  formData: StreamFormData;
-  errors: Record<string, string>;
+  formData: ScheduleFormData;
+  errors: StreamFormErrors;
   onUpdate: (data: Partial<StreamFormData>) => void;
 }
 
@@ -14,7 +19,11 @@ const MAX_MEMO_BYTES = 28;
 
 export function ScheduleStep({ formData, errors, onUpdate }: ScheduleStepProps) {
   const memo = formData.memo || "";
-  const memoByteCount = new TextEncoder().encode(memo).length;
+  // UTF-8 byte length, derived during render rather than stored in state.
+  const memoByteCount = useMemo(
+    () => new TextEncoder().encode(memo).length,
+    [memo],
+  );
 
   const isNearLimit = memoByteCount >= MAX_MEMO_BYTES * 0.8;
   const isOverLimit = memoByteCount > MAX_MEMO_BYTES;
@@ -43,7 +52,11 @@ export function ScheduleStep({ formData, errors, onUpdate }: ScheduleStepProps) 
             />
             <select
               value={formData.durationUnit}
-              onChange={(e) => onUpdate({ durationUnit: e.target.value as import("@/lib/stream-validation").DurationUnit })}
+              onChange={(e) =>
+                onUpdate({
+                  durationUnit: e.target.value as StreamFormData["durationUnit"],
+                })
+              }
               className="px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-accent outline-none"
             >
               <option value="days">Days</option>
@@ -63,7 +76,7 @@ export function ScheduleStep({ formData, errors, onUpdate }: ScheduleStepProps) 
           <input
             id="descriptionTag"
             type="text"
-            value={formData.descriptionTag}
+            value={formData.descriptionTag ?? ""}
             onChange={(e) => onUpdate({ descriptionTag: e.target.value })}
             className="w-full px-4 py-3 rounded-lg bg-black/40 border border-white/10 focus:border-accent outline-none"
             placeholder="e.g., salary, contractor-payment, subscription"

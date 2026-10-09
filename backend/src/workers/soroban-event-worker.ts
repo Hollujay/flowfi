@@ -3,6 +3,7 @@ import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../lib/prisma.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
 import { sseService } from "../services/sse.service.js";
+import { sentinelService } from "../services/sentinel.service.js";
 import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
 import {
   indexerEventsProcessedTotal,
@@ -13,11 +14,26 @@ import { withSpan } from "../lib/tracing.js";
 import logger, { requestContext } from "../logger.js";
 import { Prisma } from "../generated/prisma/index.js";
 import "../lib/stream-id.js";
+import {
+  computeStateRootHash,
+  recordCheckpoint,
+  verifyAndRecover,
+  type LedgerHeader,
+} from "../services/checkpoint.service.js";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+/** Ledger rollbacks above this ceiling are escalated to dead-letter triage. */
+const REORG_ALERT_THRESHOLD_DEFAULT = 5;
 // ─── XDR Decoding Helpers ────────────────────────────────────────────────────
 
+/** Use the ledger close time, not worker processing time, for historical state changes. */
+export function getEventLedgerTimestamp(event: Pick<rpc.Api.EventResponse, 'ledgerClosedAt'>): number {
+  const ledgerTimestamp = Number(event.ledgerClosedAt);
+  return Number.isSafeInteger(ledgerTimestamp) && ledgerTimestamp >= 0
+    ? ledgerTimestamp
+    : Math.floor(Date.now() / 1000);
+}
 /** Decode an ScVal symbol to a string. */
 export function decodeSymbol(val: xdr.ScVal): string {
   return (val as xdr.ScValSymbol).sym.toString();
@@ -100,6 +116,8 @@ export class SorobanEventWorker {
   private readonly server: rpc.Server;
   private readonly pollIntervalMs: number;
   private readonly startLedger: number;
+  /** Ledger rollbacks larger than this are escalated to dead-letter triage. */
+  private readonly reorgAlertThreshold: number;
 
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | undefined;
@@ -130,6 +148,11 @@ export class SorobanEventWorker {
       10,
     );
     this.startLedger = parseInt(process.env.INDEXER_START_LEDGER ?? "0", 10);
+    this.reorgAlertThreshold = parseInt(
+      process.env.INDEXER_REORG_ALERT_THRESHOLD ??
+        String(REORG_ALERT_THRESHOLD_DEFAULT),
+      10,
+    );
   }
 
   /**
@@ -247,7 +270,7 @@ export class SorobanEventWorker {
    * Public so that admin reset/replay paths can acquire the same lock,
    * preventing a concurrent poll from overwriting the reset cursor (#1221).
    */
-  runExclusive(fn: () => Promise<void>): Promise<void> {
+  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.batchMutex.then(fn);
     // Keep the mutex chain alive even when a batch rejects.
     const gate = run.then(
@@ -329,9 +352,127 @@ export class SorobanEventWorker {
     );
   }
 
+  /** Checkpointing only makes sense once an event contract is configured. */
+  private get checkpointsEnabled(): boolean {
+    return this.contractId.length > 0;
+  }
+
+  /**
+   * Canonical header for one ledger, or null when the RPC node cannot serve it
+   * (pruned from retention, node desynced, transient error). Public so the
+   * operator recovery path in `indexerService` can reuse it.
+   */
+  async fetchLedgerHeader(sequence: number): Promise<LedgerHeader | null> {
+    const headers = await this.fetchLedgerHeaders(sequence, sequence);
+    return headers.get(sequence) ?? null;
+  }
+
+  /**
+   * Fetch canonical headers for an inclusive ledger range.
+   *
+   * `parentHash` is derived from the previous ledger in the same response so
+   * consecutive checkpoints can be linked without decoding ledger-header XDR.
+   */
+  private async fetchLedgerHeaders(
+    startLedger: number,
+    endLedger: number,
+  ): Promise<Map<number, LedgerHeader>> {
+    const headers = new Map<number, LedgerHeader>();
+    if (endLedger < startLedger) return headers;
+
+    const PAGE_SIZE = 100;
+    let next = Math.max(0, startLedger);
+    while (next <= endLedger) {
+      const limit = Math.min(PAGE_SIZE, endLedger - next + 1);
+      const response = await this.server.getLedgers({
+        startLedger: next,
+        pagination: { limit },
+      });
+      const ledgers = response.ledgers ?? [];
+      for (const info of ledgers) {
+        headers.set(info.sequence, {
+          sequence: info.sequence,
+          hash: info.hash,
+          parentHash: extractParentLedgerHash(info),
+        });
+      }
+      const last = ledgers[ledgers.length - 1];
+      if (!last || last.sequence < next) break;
+      next = last.sequence + 1;
+    }
+    return headers;
+  }
+
+  /** Record a checkpoint for every ledger that produced events this cycle. */
+  private async recordLedgerCheckpoints(
+    processed: Map<
+      number,
+      Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
+    >,
+  ): Promise<void> {
+    if (processed.size === 0) return;
+
+    const ledgers = [...processed.keys()].sort((a, b) => a - b);
+    const min = ledgers[0]!;
+    const max = ledgers[ledgers.length - 1]!;
+
+    let headers: Map<number, LedgerHeader>;
+    try {
+      // Include one ledger below the window so the oldest checkpoint can still
+      // record a canonical parent hash.
+      headers = await this.fetchLedgerHeaders(Math.max(0, min - 1), max);
+    } catch (err) {
+      logger.warn("[SorobanWorker] Unable to fetch ledger headers for checkpoints:", err);
+      return;
+    }
+
+    for (const ledger of ledgers) {
+      const header = headers.get(ledger);
+      if (!header) continue;
+      const events = processed.get(ledger)!;
+      const parentHash = header.parentHash || headers.get(ledger - 1)?.hash || '';
+      try {
+        await recordCheckpoint({
+          sequence: ledger,
+          hash: header.hash,
+          parentHash,
+          eventsCount: events.length,
+          stateRootHash: computeStateRootHash(events),
+        });
+      } catch (err) {
+        logger.warn(`[SorobanWorker] Failed to record ledger checkpoint ${ledger}:`, err);
+      }
+    }
+  }
+
   private async runPollCycle(): Promise<void> {
     // Ensure an IndexerState row exists on first run.
-    const state = await ensureIndexerState(this.startLedger);
+    let state = await ensureIndexerState(this.startLedger);
+
+    // Pre-ingestion verification (issue #1468): before advancing the cursor,
+    // re-prove that the ledgers already checkpointed are still part of the
+    // canonical chain. A hash mismatch means an RPC failover served us a stale
+    // fork, so recover rolls every mutation above the last canonical ledger
+    // back before any new ledger is ingested.
+    if (this.checkpointsEnabled) {
+      try {
+        const recovery = await verifyAndRecover(
+          (sequence) => this.fetchLedgerHeader(sequence),
+          { alertThreshold: this.reorgAlertThreshold },
+        );
+        if (recovery.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg recovered: rolled back above ledger ` +
+              `${recovery.rollback?.safeLedger}; re-ingesting from there.`,
+          );
+          state = await ensureIndexerState(this.startLedger);
+        }
+      } catch (err) {
+        // A failure to verify is not a reorg: keep indexing forward rather than
+        // halting the pipeline on a transient RPC/DB error.
+        logger.error("[SorobanWorker] Ledger checkpoint verification failed:", err);
+      }
+    }
 
     const baseFilter = {
       filters: [
@@ -376,6 +517,11 @@ export class SorobanEventWorker {
     let lastCursor: string | null = state.lastCursor;
     let lastLedger: number = state.lastLedger;
     let sawSuccess = false;
+    // Successfully processed events grouped by ledger, for checkpointing.
+    const processedByLedger = new Map<
+      number,
+      Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
+    >();
 
     // Sort events so that 'stream_created' events are processed first in the batch.
     // This ensures that subsequent events (like 'fee_collected') that depend on
@@ -399,6 +545,13 @@ export class SorobanEventWorker {
         this.eventsProcessed += 1;
         this.recordOutcome(true);
         sawSuccess = true;
+        const ledgerEvents = processedByLedger.get(event.ledger) ?? [];
+        ledgerEvents.push({
+          ledgerSequence: event.ledger,
+          transactionHash: event.txHash,
+          eventType,
+        });
+        processedByLedger.set(event.ledger, ledgerEvents);
         // Advance the cursor to the most recent event that was successfully processed.
         // This keeps a single malformed event from pinning the entire batch forever.
         lastCursor = event.id;
@@ -423,6 +576,12 @@ export class SorobanEventWorker {
     const finalCursor = sawSuccess
       ? ((response as any).latestCursor || lastCursor)
       : lastCursor;
+
+    // Persist a hash-signed checkpoint per ingested ledger. Best-effort: a
+    // checkpoint write failure must not stall the cursor.
+    if (this.checkpointsEnabled) {
+      await this.recordLedgerCheckpoints(processedByLedger);
+    }
 
     await prisma.indexerState.upsert({
       where: { id: INDEXER_STATE_ID },
@@ -650,6 +809,13 @@ export class SorobanEventWorker {
         ? null
         : startTime + BigInt(depositedAmount) / ratePerSecondBigInt;
 
+    // Runway is how long the deposit lasts at the current rate; a zero rate
+    // never depletes. Feeds the sentinel's zero-runway flood heuristic.
+    const runwaySeconds =
+      ratePerSecondBigInt > 0n
+        ? Number(BigInt(depositedAmount) / ratePerSecondBigInt)
+        : Number.POSITIVE_INFINITY;
+
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.user.upsert({
         where: { publicKey: sender },
@@ -737,6 +903,23 @@ export class SorobanEventWorker {
       transactionHash: event.txHash,
       ledger: event.ledger,
     });
+
+    // Sentinel anomaly detection (#1469) is best-effort: an analysis failure
+    // must never quarantine a well-formed on-chain event.
+    try {
+      await sentinelService.recordStreamCreation({
+        sender,
+        token: tokenAddress,
+        streamId: String(streamId),
+        runwaySeconds,
+        ledger: event.ledger,
+      });
+    } catch (error) {
+      logger.warn(
+        `[SorobanWorker] Sentinel stream-creation analysis failed for #${streamId}:`,
+        error,
+      );
+    }
   }
 
   private async handleStreamToppedUp(
@@ -847,6 +1030,11 @@ export class SorobanEventWorker {
     const amount = decodeI128(body["amount"]);
     const timestamp = Number(decodeU64(body["timestamp"]));
 
+    // Captured inside the transaction so the sentinel can weigh this
+    // withdrawal against the stream's total deposit once it commits.
+    let streamDeposited: string | undefined;
+    let streamToken: string | undefined;
+
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       // Check for a duplicate BEFORE mutating any Stream fields so that a
       // replayed event never double-increments withdrawnAmount.
@@ -868,8 +1056,14 @@ export class SorobanEventWorker {
 
       const stream = await tx.stream.findUniqueOrThrow({
         where: { streamId },
-        select: { withdrawnAmount: true },
+        select: {
+          withdrawnAmount: true,
+          depositedAmount: true,
+          tokenAddress: true,
+        },
       });
+      streamDeposited = stream.depositedAmount;
+      streamToken = stream.tokenAddress;
 
       const newWithdrawnAmount = (
         BigInt(stream.withdrawnAmount) + BigInt(amount)
@@ -914,6 +1108,25 @@ export class SorobanEventWorker {
       ledger: event.ledger,
       timestamp,
     });
+
+    // Feed the drain sentinel (#1469). Best-effort: analysis must not
+    // quarantine a valid withdrawal event.
+    try {
+      await sentinelService.recordWithdrawal({
+        address: recipient,
+        token: streamToken ?? "unknown",
+        amount,
+        streamId: String(streamId),
+        ledger: event.ledger,
+        txHash: event.txHash,
+        ...(streamDeposited !== undefined ? { streamDeposited } : {}),
+      });
+    } catch (error) {
+      logger.warn(
+        `[SorobanWorker] Sentinel withdrawal analysis failed for #${streamId}:`,
+        error,
+      );
+    }
   }
 
   private async handleStreamCancelled(
@@ -929,7 +1142,7 @@ export class SorobanEventWorker {
 
     const amountWithdrawn = decodeI128(body["amount_withdrawn"]);
     const refundedAmount = decodeI128(body["refunded_amount"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -1002,7 +1215,7 @@ export class SorobanEventWorker {
 
     const recipient = decodeAddress(body["recipient"]);
     const totalWithdrawn = decodeI128(body["total_withdrawn"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -1136,7 +1349,7 @@ export class SorobanEventWorker {
 
     const sender = decodeAddress(body["sender"]);
     const pausedAt = Number(decodeU64(body["paused_at"]));
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.stream.update({
@@ -1208,7 +1421,7 @@ export class SorobanEventWorker {
 
     const sender = decodeAddress(body["sender"]);
     const newEndTime = decodeU64(body["new_end_time"]);
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = getEventLedgerTimestamp(event);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       // Get current stream to calculate paused duration
@@ -1286,6 +1499,27 @@ export class SorobanEventWorker {
       timestamp,
     });
   }
+}
+
+/**
+ * Extract the canonical parent hash from a ledger header response.
+ *
+ * The SDK exposes the header as a parsed `LedgerHeaderHistoryEntry`; its
+ * `previousLedgerHash()` accessor is the canonical link to the ledger before
+ * it. Returns '' when the shape is unexpected so checkpointing never aborts on
+ * a cosmetic decode issue.
+ */
+function extractParentLedgerHash(info: rpc.Api.LedgerResponse): string {
+  try {
+    const entry = info.headerXdr as unknown as {
+      header?: { previousLedgerHash?: () => Buffer | Uint8Array };
+    };
+    const previous = entry?.header?.previousLedgerHash?.();
+    if (previous) return Buffer.from(previous).toString('hex');
+  } catch {
+    // Fall through to the empty hash.
+  }
+  return '';
 }
 
 export const sorobanEventWorker = new SorobanEventWorker();

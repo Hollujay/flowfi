@@ -5,6 +5,13 @@ import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
 import { setIndexerLedgers } from '../lib/metrics.js';
 import { withSpan } from '../lib/tracing.js';
+import {
+  getLatestCheckpoint,
+  listRecentCheckpoints,
+  verifyAndRecover,
+  type ReorgRecoveryResult,
+} from './checkpoint.service.js';
+import { sendDeadLetterAlert } from './alert.service.js';
 import logger, { requestContext } from '../logger.js';
 
 export interface IndexerStatus {
@@ -37,9 +44,9 @@ export async function resetIndexer(toLedger: number): Promise<void> {
   await sorobanEventWorker.runExclusive(async () => {
     await prisma.indexerState.upsert({
       where: { id: INDEXER_STATE_ID },
-    create: { id: INDEXER_STATE_ID, lastLedger: toLedger, lastCursor: null },
-    update: { lastLedger: toLedger, lastCursor: null },
-  });
+      create: { id: INDEXER_STATE_ID, lastLedger: toLedger, lastCursor: null },
+      update: { lastLedger: toLedger, lastCursor: null },
+    });
   });
   setIndexerLedgers(toLedger, 0);
   logger.info(`[IndexerService] Reset lastProcessedLedger to ${toLedger}`);
@@ -126,13 +133,13 @@ export async function replayFromLedger(
   customRequestId?: string,
 ): Promise<string> {
   const requestId = customRequestId || requestContext.getStore()?.requestId || randomUUID();
-  return requestContext.run({ requestId }, async () => {
+  await requestContext.run({ requestId }, async () => {
     await resetIndexer(fromLedger);
     // Kick off an immediate poll cycle without waiting for the next interval.
     await sorobanEventWorker.triggerPoll(requestId);
     logger.info(`[IndexerService] Replay triggered from ledger ${fromLedger}`);
-    return requestId;
   });
+  return requestId;
 }
 
 /**
@@ -141,6 +148,65 @@ export async function replayFromLedger(
  */
 export function publishIndexerLag(currentLedger: number, networkLedger: number): void {
   setIndexerLedgers(currentLedger, networkLedger);
+}
+
+// ─── Ledger reorg / fork recovery (issue #1468) ──────────────────────────────
+
+export interface ReorgStatus {
+  lastCheckpoint: {
+    ledgerSequence: number;
+    ledgerHash: string;
+    parentHash: string;
+    eventsCount: number;
+    stateRootHash: string | null;
+    isReverted: boolean;
+    processedAt: Date;
+  } | null;
+  recentRevertedLedgers: number[];
+}
+
+/** Current checkpoint health for /health and the admin observability surface. */
+export async function getReorgStatus(): Promise<ReorgStatus> {
+  const [latest, recent] = await Promise.all([
+    getLatestCheckpoint(true),
+    listRecentCheckpoints(50),
+  ]);
+
+  return {
+    lastCheckpoint: latest
+      ? {
+          ledgerSequence: latest.ledgerSequence,
+          ledgerHash: latest.ledgerHash,
+          parentHash: latest.parentHash,
+          eventsCount: latest.eventsCount,
+          stateRootHash: latest.stateRootHash,
+          isReverted: latest.isReverted,
+          processedAt: latest.processedAt,
+        }
+      : null,
+    recentRevertedLedgers: recent
+      .filter((checkpoint) => checkpoint.isReverted)
+      .map((checkpoint) => checkpoint.ledgerSequence),
+  };
+}
+
+/**
+ * Operator-triggered reorg recovery.
+ *
+ * Runs the same verification/rollback the poll loop performs, but under the
+ * worker mutex so it cannot race an in-flight batch, then kicks a poll so
+ * ingestion resumes from the recovered ledger immediately.
+ */
+export async function recoverFromReorg(): Promise<ReorgRecoveryResult> {
+  const result = await sorobanEventWorker.runExclusive(() =>
+    verifyAndRecover((sequence) => sorobanEventWorker.fetchLedgerHeader(sequence)),
+  );
+
+  if (result.detected) {
+    await sorobanEventWorker.triggerPoll();
+  }
+
+  return result;
 }
 
 // ─── Dead-letter quarantine ───────────────────────────────────────────────────
@@ -223,7 +289,11 @@ function eventTypeOf(event: rpc.Api.EventResponse): string {
   const topic0 = event.topic?.[0];
   if (!topic0) return 'unknown';
   try {
-    return topic0.type === 'scvSymbol' ? topic0.sym.toString() : 'unknown';
+    // `ScVal` is a union; only the symbol arm carries `sym`, and in recent
+    // stellar-sdk versions it is a value (not a method). Read the property and
+    // stringify it so this survives across SDK generations.
+    const sym = (topic0 as unknown as { sym?: { toString(): string } }).sym;
+    return sym ? sym.toString() : 'unknown';
   } catch {
     return 'unknown';
   }
@@ -250,7 +320,7 @@ export async function quarantineEvent(
   const errorMessage = err instanceof Error ? err.message : String(err);
 
   try {
-    await prisma.indexerDeadLetterEvent.upsert({
+    const row = await prisma.indexerDeadLetterEvent.upsert({
       where: { eventId_eventType: { eventId: event.id, eventType } },
       create: {
         eventId: event.id,
@@ -273,6 +343,19 @@ export async function quarantineEvent(
     logger.error(
       `[IndexerService] Quarantined event ${event.id} (${eventType}) at ledger ${event.ledger}: ${errorMessage}`,
     );
+
+    // Fire-and-forget: the alert is deliberately not awaited so a slow or
+    // unreachable chat webhook cannot stall the poll loop. `sendDeadLetterAlert`
+    // never rejects, but guard with `void …catch` anyway.
+    void sendDeadLetterAlert({
+      eventId: event.id,
+      eventType,
+      ledgerSequence: event.ledger,
+      txHash: event.txHash,
+      errorMessage,
+      errorStack: err instanceof Error ? err.stack : undefined,
+      attempts: row?.attempts,
+    }).catch(() => undefined);
   } catch (dbErr) {
     // Never let quarantine bookkeeping itself kill the poll loop.
     logger.error(

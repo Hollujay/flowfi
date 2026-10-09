@@ -362,30 +362,46 @@ export async function submitContractCall(method: string, args: xdr.ScVal[], send
  * could immediately read chain state and see a pre-transaction view. Returns
  * the final successful transaction response, or throws when the transaction
  * fails on-chain or the confirmation window lapses.
+ *
+ * Poll Soroban RPC getTransaction until the transaction reaches a terminal
+ * status (SUCCESS or FAILED) or until the bounded timeout expires.
  */
 export async function pollTransactionStatus(
   txHash: string,
   timeoutMs: number = getTxConfirmationTimeoutMs(),
   pollIntervalMs: number = getTxPollIntervalMs(),
-): Promise<rpc.Api.GetTransactionResponse> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const status = await withRpcTimeout('getTransaction', () =>
-      executeRpc('getTransaction', (server) => server.getTransaction(txHash)),
+): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    const txResponse = await withRpcRetry('getTransaction', () =>
+      withRpcTimeout('getTransaction', () => executeRpc('getTransaction', (server) => server.getTransaction(txHash))),
     );
 
-    if (status.status === rpc.Api.GetTransactionStatus.SUCCESS) return status;
-    if (status.status === rpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error(`Transaction failed on-chain: ${txHash}`);
+    if (
+      txResponse.status === rpc.Api.GetTransactionStatus.SUCCESS ||
+      (txResponse.status as string) === 'SUCCESS'
+    ) {
+      return txResponse as rpc.Api.GetSuccessfulTransactionResponse;
     }
-    // STILL_PENDING / NOT_FOUND — stop on timeout, otherwise wait and poll again.
-    if (Date.now() >= deadline) {
-      throw new Error(
-        `Transaction confirmation timed out after ${timeoutMs}ms: ${txHash}`,
-      );
+
+    if (
+      txResponse.status === rpc.Api.GetTransactionStatus.FAILED ||
+      (txResponse.status as string) === 'FAILED'
+    ) {
+      const failed = txResponse as rpc.Api.GetFailedTransactionResponse;
+      const errorDetail = failed.resultXdr
+        ? ` (resultXdr: ${failed.resultXdr.toXDR('base64')})`
+        : '';
+      throw new Error(`Transaction failed on-chain: ${txHash}${errorDetail}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+
+    if (pollIntervalMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
   }
+
+  throw new Error(`Transaction confirmation timed out after ${timeoutMs}ms: ${txHash}`);
 }
 
 /**
@@ -874,8 +890,8 @@ function readResourceFootprint(
     const data = transactionData.build();
     const resources = data.resources;
     return {
-      cpuInstructions: resources.instructions,
-      memoryBytes: resources.writeBytes,
+      cpuInstructions: Number(resources.instructions),
+      memoryBytes: Number(resources.writeBytes),
     };
   } catch (err) {
     logger.warn('[SorobanService] Could not read resource footprint from simulation:', err);

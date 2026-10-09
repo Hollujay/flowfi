@@ -17,9 +17,11 @@ export const adminRateLimiter = rateLimit({
     // rotate addresses to bypass the limit — express-rate-limit's
     // ERR_ERL_KEY_GEN_IPV6 requirement).
     const forwarded = req.headers['x-forwarded-for'];
-    const firstHop = typeof forwarded === 'string' ? forwarded.split(',')[0]?.trim() : undefined;
-    if (firstHop) return firstHop;
-    return req.ip ? ipKeyGenerator(req.ip) : 'unknown';
+    const ip =
+      typeof forwarded === 'string'
+        ? (forwarded.split(',')[0]?.trim() ?? req.ip)
+        : req.ip;
+    return ipKeyGenerator(ip ?? 'unknown');
   },
   skip: (req: Request): boolean => {
     // Skip rate limiting in test environment
